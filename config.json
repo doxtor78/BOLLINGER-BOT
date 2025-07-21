@@ -1,0 +1,6 @@
+{
+    "symbol": "XBTUSD",
+    "timeframe": "1m",
+    "sma_window": 5,
+    "order_size_contracts": 100
+}

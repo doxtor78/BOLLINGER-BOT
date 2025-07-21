@@ -1,0 +1,53 @@
+# IN-AND-OUT-BOT Setup Instructions
+
+This document provides instructions on how to set up and run the trading bot.
+
+## 1. Create a Virtual Environment (Recommended)
+
+It's best practice to run the bot in a dedicated Python virtual environment.
+
+```bash
+cd /Users/erhangocmez/IN-AND-OUT-BOT
+python3 -m venv venv
+source venv/bin/activate
+```
+
+## 2. Install Dependencies
+
+Install the required Python packages using the `requirements.txt` file.
+
+```bash
+pip install -r requirements.txt
+```
+
+## 3. Create .env file for API Keys
+
+The bot uses a `.env` file to securely load your API keys. Create a file named `.env` in the `/Users/erhangocmez/IN-AND-OUT-BOT` directory and add your BitMEX testnet API keys to it:
+
+```
+BITMEX_TESTNET_API_KEY="YOUR_API_KEY"
+BITMEX_TESTNET_API_SECRET="YOUR_API_SECRET"
+```
+
+Replace `"YOUR_API_KEY"` and `"YOUR_API_SECRET"` with your actual keys.
+
+## 4. System Time Synchronization
+
+The bot is sensitive to time synchronization between your system and the exchange's servers. The bot now includes an automatic time-resync feature.
+
+However, it is highly recommended to ensure your system clock is set to update automatically to prevent errors.
+
+You can use the provided utility to check your time sync:
+```bash
+python check_time_sync.py
+```
+
+## 5. Running the Bot
+
+Once the setup is complete, you can run the bot:
+
+```bash
+python live_bot.py
+```
+
+The bot will start running, log its activities to `bot.log` and the console, and manage its state in `state.json`. 
