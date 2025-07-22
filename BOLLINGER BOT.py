@@ -6,7 +6,6 @@ import logging
 import pandas as pd
 from dotenv import load_dotenv
 import requests
-from datetime import datetime, timezone
 
 # --- Setup ---
 load_dotenv()
@@ -50,7 +49,9 @@ def resync_time(exchange):
 def load_config():
     try:
         with open('config.json', 'r') as f:
-            return json.load(f)
+            config = json.load(f)
+            config['order_size_contracts'] = 500  # Ensure entry order size is 500
+            return config
     except FileNotFoundError:
         logger.error("config.json not found.")
         return None
@@ -100,10 +101,8 @@ def load_state():
         'position_size': 0,
         'signal_confirm_count': 0,
         'entry_order_ids': [],
-        'tp_placed_for_entry': {},
         'tp_order_ids': {},
-        'tp_filled_amount': {},
-        'tp_band_prices': {}  # Track last used TP band prices for each entry order
+        'last_known_position_size': 0,
     }
 
 def save_state(state):
@@ -266,23 +265,6 @@ def close_position(exchange, symbol, position_size, tick_size):
         logger.error(f"Failed to close position: {e}")
         return None
 
-def open_position(exchange, symbol, side, amount, tick_size):
-    try:
-        ticker = exchange.fetch_ticker(symbol)
-        action_time = time.time()
-        price = ticker['ask'] if side == 'buy' else ticker['bid']
-        print(f"[ACTION] Opening {side.upper()} position with LIMIT order for {amount} at {price}")
-        logger.info(f"Opening {side.upper()} position with order at {price}")
-        order_id = place_limit_order(exchange, symbol, side, amount, price, tick_size)
-        elapsed = time.time() - action_time
-        print(f"[TIMING] Time to OPEN {side.upper()} after signal: {elapsed:.2f} seconds")
-        logger.info(f"Time to OPEN {side.upper()} after signal: {elapsed:.2f} seconds")
-        logger.info(f"Opening {side.upper()} position with order {order_id}")
-        return order_id
-    except Exception as e:
-        logger.error(f"Failed to open position: {e}")
-        return None
-
 # --- Add this helper function to cancel TP orders for closed positions ---
 def cancel_tp_orders(exchange, symbol, tp_order_ids):
     for order_id in tp_order_ids:
@@ -294,13 +276,22 @@ def cancel_tp_orders(exchange, symbol, tp_order_ids):
 
 # --- Update place_mirror_tp_orders to retry on failure ---
 def place_mirror_tp_orders(exchange, symbol, side, filled_size, bands, tick_size, tp_orders_state):
+    # Place 5 TP orders, each for (total_filled / 5) contracts, at 5 bands
     if side == 'buy':
         tp_band_keys = ['+1', '+1.5', '+2', '+2.5', '+3']
         tp_side = 'sell'
     else:
         tp_band_keys = ['-1', '-1.5', '-2', '-2.5', '-3']
         tp_side = 'buy'
-    tp_size = filled_size / len(tp_band_keys)
+    # Calculate total filled size for all entries
+    state = load_state()
+    total_filled = 0
+    for entry_id in state.get('entry_order_ids', []):
+        total_filled += 500 if entry_id in state.get('tp_filled_amount', {}) else 0
+    # If this is a new fill, add it
+    if filled_size and filled_size > 0:
+        total_filled += filled_size
+    tp_size = total_filled // 5 if total_filled >= 5 * 100 else 100  # At least 100 per TP order
     tp_order_ids = []
     for k in tp_band_keys:
         price = bands[k]
@@ -318,6 +309,32 @@ def place_mirror_tp_orders(exchange, symbol, side, filled_size, bands, tick_size
         else:
             logger.error(f"Giving up on TP order at {price:.2f} after 3 attempts.")
     return tp_order_ids
+
+# Add helper function to wait for position flattening
+def wait_for_flat_position(exchange, symbol, timeout=60):
+    for _ in range(timeout):
+        time.sleep(1)
+        if fetch_position(exchange, symbol) == 0:
+            return True
+    return False
+
+# Add helper function to place laddered entry orders
+def place_laddered_entries(exchange, symbol, band_keys, order_side, bands, suborder_size, max_orders, state, tick_size):
+    entry_order_ids = []
+    for k in band_keys[:max_orders]:
+        price = bands[k]
+        logger.info(f"Placing laddered {order_side.upper()} order at {price:.2f} for {suborder_size} contracts (band {k}σ)")
+        order_id = place_limit_order(exchange, symbol, order_side, suborder_size, price, tick_size)
+        if order_id:
+            entry_order_ids.append(order_id)
+    state['entry_order_ids'].extend(entry_order_ids)
+    save_state(state)
+
+# Helper to get open entry orders for the current signal
+def get_open_entry_orders(exchange, symbol, signal):
+    open_orders = fetch_open_orders(exchange, symbol)
+    side = 'buy' if signal == 'long' else 'sell'
+    return sum([abs(order['amount']) for order in open_orders if order['side'] == side])
 
 # --- Main Application Logic ---
 def main():
@@ -342,6 +359,9 @@ def main():
 
     logger.info(f"Configuration: Trading {symbol} on {timeframe} with SMA window {sma_window}.")
     logger.info(f"Order size: {order_size_contracts} contracts. Tick size: {tick_size}")
+
+    # Define max position size
+    MAX_POSITION_SIZE = 2500
 
     # Connection health check counter
     connection_errors = 0
@@ -476,60 +496,45 @@ def main():
                 save_state(state)
                 continue
 
+            # When placing entry orders (long or short):
+            # Only place new entry orders if abs(position_size) < MAX_POSITION_SIZE
             if signal == 'long' and position_size <= 0:
                 if position_size < 0:
                     logger.info("Reversing from SHORT to LONG.")
                     close_position(exchange, symbol, position_size, tick_size)
-                    # Wait until position is flat
-                    for _ in range(60):  # Wait up to 60 seconds
-                        time.sleep(1)
-                        new_position = fetch_position(exchange, symbol)
-                        if new_position == 0:
-                            break
-                    else:
-                        logger.warning("Position did not flatten after closing SHORT. Skipping open.")
+                    if not wait_for_flat_position(exchange, symbol):
+                        logger.warning("Position did not flatten after reversal. Skipping entry.")
                         continue
-                # Laddered long orders at -3, -2.5, -2, -1.5, -1 bands
+                # Strict cap: check both filled and open entry orders
+                current_position = abs(position_size)
+                open_entry_orders = get_open_entry_orders(exchange, symbol, signal)
+                total_committed = current_position + open_entry_orders
+                remaining = MAX_POSITION_SIZE - total_committed
+                if remaining <= 0:
+                    logger.info("Max position size (including open orders) reached. No new entry orders will be placed.")
+                    continue
                 band_keys = ['-3', '-2.5', '-2', '-1.5', '-1']
-                suborder_size = order_size_contracts / len(band_keys)
-                entry_order_ids = []
-                for k in band_keys:
-                    price = bands[k]
-                    logger.info(f"Placing laddered LONG order at {price:.2f} for {suborder_size} contracts (band {k}σ)")
-                    order_id = place_limit_order(exchange, symbol, 'buy', suborder_size, price, tick_size)
-                    if order_id:
-                        entry_order_ids.append(order_id)
-                state['entry_order_ids'] = entry_order_ids
-                state['tp_placed_for_entry'] = {}
-                save_state(state)
-                action_taken = True
+                suborder_size = 500
+                num_orders = min(remaining // suborder_size, len(band_keys))
+                place_laddered_entries(exchange, symbol, band_keys, 'buy', bands, suborder_size, num_orders, state, tick_size)
             elif signal == 'short' and position_size >= 0:
                 if position_size > 0:
                     logger.info("Reversing from LONG to SHORT.")
                     close_position(exchange, symbol, position_size, tick_size)
-                    # Wait until position is flat
-                    for _ in range(60):  # Wait up to 60 seconds
-                        time.sleep(1)
-                        new_position = fetch_position(exchange, symbol)
-                        if new_position == 0:
-                            break
-                    else:
-                        logger.warning("Position did not flatten after closing LONG. Skipping open.")
+                    if not wait_for_flat_position(exchange, symbol):
+                        logger.warning("Position did not flatten after reversal. Skipping entry.")
                         continue
-                # Laddered short orders at +1, +1.5, +2, +2.5, +3 bands
+                current_position = abs(position_size)
+                open_entry_orders = get_open_entry_orders(exchange, symbol, signal)
+                total_committed = current_position + open_entry_orders
+                remaining = MAX_POSITION_SIZE - total_committed
+                if remaining <= 0:
+                    logger.info("Max position size (including open orders) reached. No new entry orders will be placed.")
+                    continue
                 band_keys = ['+1', '+1.5', '+2', '+2.5', '+3']
-                suborder_size = order_size_contracts / len(band_keys)
-                entry_order_ids = []
-                for k in band_keys:
-                    price = bands[k]
-                    logger.info(f"Placing laddered SHORT order at {price:.2f} for {suborder_size} contracts (band {k}σ)")
-                    order_id = place_limit_order(exchange, symbol, 'sell', suborder_size, price, tick_size)
-                    if order_id:
-                        entry_order_ids.append(order_id)
-                state['entry_order_ids'] = entry_order_ids
-                state['tp_placed_for_entry'] = {}
-                save_state(state)
-                action_taken = True
+                suborder_size = 500
+                num_orders = min(remaining // suborder_size, len(band_keys))
+                place_laddered_entries(exchange, symbol, band_keys, 'sell', bands, suborder_size, num_orders, state, tick_size)
             elif signal == 'flat' and position_size != 0:
                 logger.info("Signal is FLAT, closing position.")
                 close_position(exchange, symbol, position_size, tick_size)
@@ -562,79 +567,81 @@ def main():
                     logger.warning("SOFT STOP LOSS triggered for SHORT: price above +4σ. Closing with limit orders.")
                     close_position(exchange, symbol, position_size, tick_size)
 
-            # Check entry order fills and place TPs
-            for entry_order_id in state.get('entry_order_ids', []):
-                try:
-                    order = exchange.fetch_order(entry_order_id, symbol)
-                    filled = float(order.get('filled', 0))
-                    already_tp = state.get('tp_filled_amount', {}).get(entry_order_id, 0)
-                    new_fill = filled - already_tp
-                    if new_fill > 0:
-                        logger.info(f"Entry order {entry_order_id} new fill: {new_fill} contracts. Placing mirror TPs.")
-                        tp_ids = place_mirror_tp_orders(exchange, symbol, order['side'], new_fill, bands, tick_size, {})
-                        if 'tp_order_ids' not in state:
-                            state['tp_order_ids'] = {}
-                        if entry_order_id not in state['tp_order_ids']:
-                            state['tp_order_ids'][entry_order_id] = []
-                        state['tp_order_ids'][entry_order_id].extend(tp_ids)
-                        if 'tp_filled_amount' not in state:
-                            state['tp_filled_amount'] = {}
-                        state['tp_filled_amount'][entry_order_id] = already_tp + new_fill
-                        save_state(state)
-                except Exception as e:
-                    logger.error(f"Error checking entry order {entry_order_id}: {e}")
-
             # Dynamic TP updating for open positions
-            for entry_order_id in state.get('entry_order_ids', []):
-                tp_ids = state.get('tp_order_ids', {}).get(entry_order_id, [])
-                if not tp_ids:
-                    continue
-                order = exchange.fetch_order(entry_order_id, symbol)
-                filled = float(order.get('filled', 0))
-                if filled == 0:
-                    continue
-                # Determine current TP band prices
-                if order['side'] == 'buy':
+            if abs(position_size) >= 100:
+                if position_size > 0:
                     tp_band_keys = ['+1', '+1.5', '+2', '+2.5', '+3']
+                    tp_side = 'sell'
                 else:
                     tp_band_keys = ['-1', '-1.5', '-2', '-2.5', '-3']
-                current_tp_prices = [bands[k] for k in tp_band_keys]
-                last_tp_prices = state.get('tp_band_prices', {}).get(entry_order_id, [])
-                # If any TP price has moved by more than tick_size, update TPs
-                need_update = False
-                if last_tp_prices and len(last_tp_prices) == len(current_tp_prices):
-                    for old, new in zip(last_tp_prices, current_tp_prices):
-                        if abs(old - new) > tick_size:
-                            need_update = True
-                            break
-                else:
-                    need_update = True
-                if need_update:
-                    logger.info(f"TP bands moved for entry {entry_order_id}. Updating TP orders.")
-                    cancel_tp_orders(exchange, symbol, tp_ids)
-                    tp_size = (state.get('tp_filled_amount', {}).get(entry_order_id, 0) or filled) / len(tp_band_keys)
+                    tp_side = 'buy'
+                tp_size = abs(position_size) // 5
+                # Cancel all existing TP orders
+                all_tp_ids = []
+                for tp_list in state.get('tp_order_ids', {}).values():
+                    all_tp_ids.extend(tp_list)
+                cancel_tp_orders(exchange, symbol, all_tp_ids)
+                # Place 5 new TP orders
+                new_tp_ids = []
+                for k in tp_band_keys:
+                    price = bands[k]
+                    logger.info(f"Placing TP order at {price:.2f} for {tp_size} contracts (band {k}σ)")
+                    order_id = None
+                    for attempt in range(3):
+                        try:
+                            order_id = place_limit_order(exchange, symbol, tp_side, tp_size, price, tick_size)
+                            if order_id:
+                                break
+                        except Exception as e:
+                            logger.error(f"Failed to place TP order at {price:.2f} (attempt {attempt+1}): {e}")
+                    if order_id:
+                        new_tp_ids.append(order_id)
+                    else:
+                        logger.error(f"Giving up on TP order at {price:.2f} after 3 attempts.")
+                # Store new TP order ids in state
+                state['tp_order_ids'] = {'main': new_tp_ids}
+                save_state(state)
+
+            # In main loop, after fetching position_size:
+            prev_position_size = state.get('last_known_position_size', 0)
+            if position_size != prev_position_size:
+                # Cancel all existing TP orders
+                all_tp_ids = []
+                for ids in state.get('tp_order_ids', {}).values():
+                    all_tp_ids.extend(ids)
+                for tp_id in all_tp_ids:
+                    try:
+                        exchange.cancel_order(tp_id, symbol)
+                        logger.info(f"Cancelled TP order {tp_id}")
+                    except Exception as e:
+                        logger.warning(f"Failed to cancel TP order {tp_id}: {e}")
+                state['tp_order_ids'] = {}
+                # Only place new TP orders if position is nonzero
+                if position_size != 0:
+                    total_contracts = abs(position_size)
+                    tp_count = 5
+                    tp_size = total_contracts // tp_count
+                    leftover = total_contracts % tp_count
+                    if position_size > 0:
+                        tp_band_keys = ['+1', '+1.5', '+2', '+2.5', '+3']
+                        tp_side = 'sell'
+                    else:
+                        tp_band_keys = ['-1', '-1.5', '-2', '-2.5', '-3']
+                        tp_side = 'buy'
                     new_tp_ids = []
-                    for k in tp_band_keys:
+                    for i, k in enumerate(tp_band_keys):
                         price = bands[k]
-                        for attempt in range(3):
-                            try:
-                                tp_id = place_limit_order(exchange, symbol, 'sell' if order['side']=='buy' else 'buy', tp_size, price, tick_size)
-                                if tp_id:
-                                    new_tp_ids.append(tp_id)
-                                    break
-                            except Exception as e:
-                                logger.error(f"Failed to place updated TP order at {price:.2f} (attempt {attempt+1}): {e}")
-                    state['tp_order_ids'][entry_order_id] = new_tp_ids
-                    if 'tp_band_prices' not in state:
-                        state['tp_band_prices'] = {}
-                    state['tp_band_prices'][entry_order_id] = current_tp_prices
-                    save_state(state)
-                else:
-                    # No update needed, but store the current prices if not already
-                    if 'tp_band_prices' not in state:
-                        state['tp_band_prices'] = {}
-                    state['tp_band_prices'][entry_order_id] = current_tp_prices
-                    save_state(state)
+                        size = tp_size + (leftover if i == 0 else 0)
+                        try:
+                            tp_id = place_limit_order(exchange, symbol, tp_side, size, price, tick_size)
+                            if tp_id:
+                                new_tp_ids.append(tp_id)
+                                logger.info(f"Placed TP order at {price:.2f} for {size} contracts (band {k}σ)")
+                        except Exception as e:
+                            logger.warning(f"Failed to place TP order at {price:.2f}: {e}")
+                    state['tp_order_ids']['global'] = new_tp_ids
+                state['last_known_position_size'] = position_size
+                save_state(state)
 
             if action_taken:
                 time.sleep(5)
@@ -647,8 +654,6 @@ def main():
                 for tp_list in state.get('tp_order_ids', {}).values():
                     cancel_tp_orders(exchange, symbol, tp_list)
                 state['tp_order_ids'] = {}
-                state['tp_filled_amount'] = {}
-                state['tp_placed_for_entry'] = {}
                 save_state(state)
 
             # --- Placeholder for dynamic TP update logic ---
