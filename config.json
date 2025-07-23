@@ -2,5 +2,8 @@
     "symbol": "XBTUSD",
     "timeframe": "1m",
     "sma_window": 5,
-    "order_size_contracts": 500
+    "order_size_contracts": 500,
+    "tick_size": 0.5,
+    "signal_confirm_bars": 1,
+    "order_timeout": 30
 }

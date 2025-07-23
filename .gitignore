@@ -1,0 +1,23 @@
+# Sensitive files
+.env
+*.env
+
+# Runtime files
+bot.log
+state.json
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db 

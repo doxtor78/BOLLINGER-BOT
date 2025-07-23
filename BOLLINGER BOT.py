@@ -171,6 +171,7 @@ def get_signal(df, sma_window):
     price = df['close'].iloc[-1]
     sma = df['close'].rolling(window=sma_window).mean().iloc[-1]
     std = df['close'].rolling(window=sma_window).std().iloc[-1]
+    
     # Calculate Bollinger Bands for 1, 1.5, 2, 2.5, 3 stddev
     bands = {
         '-3': sma - 3 * std,
@@ -184,6 +185,7 @@ def get_signal(df, sma_window):
         '+2.5': sma + 2.5 * std,
         '+3': sma + 3 * std,
     }
+    
     # Long: price between -3σ and -1σ
     if bands['-3'] <= price <= bands['-1']:
         return 'long', price, sma, bands
@@ -318,24 +320,6 @@ def wait_for_flat_position(exchange, symbol, timeout=60):
             return True
     return False
 
-# Add helper function to place laddered entry orders
-def place_laddered_entries(exchange, symbol, band_keys, order_side, bands, suborder_size, max_orders, state, tick_size):
-    entry_order_ids = []
-    for k in band_keys[:max_orders]:
-        price = bands[k]
-        logger.info(f"Placing laddered {order_side.upper()} order at {price:.2f} for {suborder_size} contracts (band {k}σ)")
-        order_id = place_limit_order(exchange, symbol, order_side, suborder_size, price, tick_size)
-        if order_id:
-            entry_order_ids.append(order_id)
-    state['entry_order_ids'].extend(entry_order_ids)
-    save_state(state)
-
-# Helper to get open entry orders for the current signal
-def get_open_entry_orders(exchange, symbol, signal):
-    open_orders = fetch_open_orders(exchange, symbol)
-    side = 'buy' if signal == 'long' else 'sell'
-    return sum([abs(order['amount']) for order in open_orders if order['side'] == side])
-
 # --- Main Application Logic ---
 def main():
     logger.info("--- Starting robust in-and-out trading bot ---")
@@ -428,119 +412,171 @@ def main():
                 time.sleep(60)
                 continue
 
-            # 4. Fetch position
+            # 4. Fetch position and open orders (only once per cycle)
             logger.info("Checking current position...")
+            prev_position_size = state.get('last_known_position_size', 0)
             position_size = fetch_position(exchange, symbol)
             if position_size is None:
-                time.sleep(60)
+                time.sleep(2)
                 continue
             state['position_size'] = position_size
-            save_state(state)
 
-            # 5. Order management
+            # Fetch open orders once per cycle
             open_orders = fetch_open_orders(exchange, symbol)
-            if open_orders:
-                logger.info(f"Found {len(open_orders)} open order(s). Managing...")
-                for order in open_orders:
+
+            # Immediately check and update TP orders if position changed
+            def update_tp_orders():
+                if position_size != 0:
+                    # Cancel all existing TP orders
+                    all_tp_ids = []
+                    for ids in state.get('tp_order_ids', {}).values():
+                        all_tp_ids.extend(ids)
+                    for tp_id in all_tp_ids:
+                        try:
+                            exchange.cancel_order(tp_id, symbol)
+                        except Exception as e:
+                            logger.warning(f"Failed to cancel TP order {tp_id}: {e}")
+                    state['tp_order_ids'] = {}
+                    # Place TP orders only if position is large enough
+                    total_contracts = abs(position_size)
+                    min_order_size = 100  # BitMEX minimum
+                    tp_count = 5
+                    
+                    # Only place TP orders if we can create at least one valid order
+                    if total_contracts >= min_order_size:
+                        # Calculate how many TP orders we can actually place
+                        max_possible_orders = min(tp_count, total_contracts // min_order_size)
+                        if max_possible_orders > 0:
+                            tp_size = total_contracts // max_possible_orders
+                            leftover = total_contracts % max_possible_orders
+                            
+                            if position_size > 0:
+                                tp_band_keys = ['+1', '+1.5', '+2', '+2.5', '+3'][:max_possible_orders]
+                                tp_side = 'sell'
+                            else:
+                                tp_band_keys = ['-1', '-1.5', '-2', '-2.5', '-3'][:max_possible_orders]
+                                tp_side = 'buy'
+                            
+                            new_tp_ids = []
+                            for i, k in enumerate(tp_band_keys):
+                                price = bands[k]
+                                size = tp_size + (leftover if i == 0 else 0)
+                                # Ensure size meets minimum requirement
+                                if size >= min_order_size:
+                                    try:
+                                        tp_id = place_limit_order(exchange, symbol, tp_side, size, price, tick_size)
+                                        if tp_id:
+                                            new_tp_ids.append(tp_id)
+                                            logger.info(f"Placed TP order at {price:.2f} for {size} contracts (band {k}σ)")
+                                    except Exception as e:
+                                        logger.warning(f"Failed to place TP order at {price:.2f}: {e}")
+                            
+                            state['tp_order_ids']['global'] = new_tp_ids
+                            if new_tp_ids:
+                                logger.info(f"Placed {len(new_tp_ids)} TP orders for position of {total_contracts} contracts")
+                else:
+                    # If position is zero, cancel all TP orders
+                    all_tp_ids = []
+                    for ids in state.get('tp_order_ids', {}).values():
+                        all_tp_ids.extend(ids)
+                    for tp_id in all_tp_ids:
+                        try:
+                            exchange.cancel_order(tp_id, symbol)
+                        except Exception as e:
+                            logger.warning(f"Failed to cancel TP order {tp_id}: {e}")
+                    state['tp_order_ids'] = {}
+                    state['last_known_position_size'] = 0
+                
+                state['last_known_position_size'] = position_size
+                save_state(state)
+
+            if position_size != prev_position_size:
+                update_tp_orders()
+
+            # 5. Order management (using cached open_orders)
+            entry_orders = [o for o in open_orders if o['side'] in ['buy', 'sell']]
+            tp_orders = []  # Separate TP orders if needed
+            
+            if entry_orders:
+                logger.info(f"Managing {len(entry_orders)} open entry orders...")
+                orders_to_remove = []
+                for order in entry_orders:
                     try:
-                        # If order is too far from market, amend
+                        # If order is too far from market, cancel it (will be replaced by dynamic logic)
                         ticker = exchange.fetch_ticker(symbol)
                         best_price = ticker['ask'] if order['side'] == 'buy' else ticker['bid']
                         price_diff = abs(order['price'] - best_price)
-                        if price_diff > tick_size:
-                            logger.info(f"Amending order {order['id']} from {order['price']} to {best_price}")
-                            amend_order(exchange, symbol, order['id'], best_price, tick_size)
-                        # If order is too old, cancel and replace
-                        order_age = (pd.Timestamp.now() - pd.to_datetime(order['timestamp'], unit='ms')).total_seconds()
-                        if order_age > order_timeout:
-                            logger.info(f"Order {order['id']} is too old ({order_age:.2f}s), cancelling.")
+                        if price_diff > tick_size * 10:  # More than 10 ticks away
                             exchange.cancel_order(order['id'], symbol)
+                            orders_to_remove.append(order)
+                            logger.info(f"Cancelled order {order['id']} (too far from market)")
+                        # If order is too old, cancel it
+                        elif hasattr(order, 'timestamp') and order.get('timestamp'):
+                            order_age = (pd.Timestamp.now() - pd.to_datetime(order['timestamp'], unit='ms')).total_seconds()
+                            if order_age > order_timeout:
+                                exchange.cancel_order(order['id'], symbol)
+                                orders_to_remove.append(order)
+                                logger.info(f"Cancelled order {order['id']} (too old: {order_age:.1f}s)")
                     except Exception as e:
                         logger.error(f"Error managing order {order.get('id', 'unknown')}: {e}")
-                # Wait for all open orders to be cleared before proceeding
-                logger.info("Waiting for all open orders to be cleared before placing new orders...")
-                for _ in range(30):  # Wait up to 30 seconds
-                    time.sleep(1)
-                    open_orders = fetch_open_orders(exchange, symbol)
-                    if not open_orders:
-                        break
-                else:
-                    logger.warning("Open orders not cleared after 30 seconds. Skipping this cycle.")
-                    continue
-                # After open orders are cleared, re-fetch position to ensure it's updated
-                for _ in range(10):  # Wait up to 10 seconds for position update
-                    new_position = fetch_position(exchange, symbol)
-                    if new_position != position_size:
-                        logger.info(f"Position updated from {position_size} to {new_position} after clearing open orders.")
-                        position_size = new_position
-                        state['position_size'] = position_size
-                        save_state(state)
-                        break
-                    time.sleep(1)
-                else:
-                    logger.warning("Position did not update after clearing open orders. Skipping this cycle.")
-                    continue
+                
+                # Update open_orders list
+                for order in orders_to_remove:
+                    open_orders.remove(order)
 
-            # 6. Main strategy logic (in-and-out)
-            action_taken = False
-            # Before placing a new order, double-check there are no open orders and position is as expected
-            open_orders = fetch_open_orders(exchange, symbol)
-            if open_orders:
-                logger.warning("Open orders detected before placing a new order. Skipping this cycle.")
-                continue
-            confirmed_position = fetch_position(exchange, symbol)
-            if confirmed_position != position_size:
-                logger.warning(f"Position changed unexpectedly from {position_size} to {confirmed_position}. Skipping this cycle.")
-                position_size = confirmed_position
-                state['position_size'] = position_size
-                save_state(state)
-                continue
+            # --- Dynamic Band-Based Entry Order Updating ---
+            if signal in ['long', 'short']:
+                # Define which band keys to use for this signal
+                band_keys = ['-3', '-2.5', '-2', '-1.5', '-1'] if signal == 'long' else ['+1', '+1.5', '+2', '+2.5', '+3']
+                side = 'buy' if signal == 'long' else 'sell'
+                
+                # Calculate current committed position size
+                current_position = abs(position_size)
+                entry_orders_for_signal = [o for o in open_orders if o['side'] == side]
+                # Filter out orders with None amount to prevent NoneType errors
+                valid_entry_orders = [o for o in entry_orders_for_signal if o.get('amount') is not None]
+                open_entry_orders_size = sum([abs(order['amount']) for order in valid_entry_orders])
+                total_committed = current_position + open_entry_orders_size
+                
+                # Map open entry orders to band keys (by price)
+                band_to_order = {}
+                for order in valid_entry_orders:
+                    for k in band_keys:
+                        band_price = round_to_tick(bands[k], tick_size)
+                        if abs(order['price'] - band_price) < tick_size:
+                            band_to_order[k] = order
+                            break
+                
+                # Update or place orders for each band key
+                for k in band_keys:
+                    band_price = round_to_tick(bands[k], tick_size)
+                    order = band_to_order.get(k)
+                    # Check if adding this order would exceed the cap
+                    if total_committed + order_size_contracts - (abs(order['amount']) if order else 0) > MAX_POSITION_SIZE:
+                        continue
+                    if order:
+                        # If price has changed, cancel and replace
+                        if abs(order['price'] - band_price) >= tick_size:
+                            try:
+                                exchange.cancel_order(order['id'], symbol)
+                                place_limit_order(exchange, symbol, side, order['amount'], band_price, tick_size)
+                                logger.info(f"Updated entry order for band {k} to {band_price}")
+                            except Exception as e:
+                                logger.error(f"Failed to update entry order for band {k}: {e}")
+                    else:
+                        # No order for this band key, place a new one
+                        if total_committed + order_size_contracts <= MAX_POSITION_SIZE:
+                            try:
+                                place_limit_order(exchange, symbol, side, order_size_contracts, band_price, tick_size)
+                                logger.info(f"Placed new entry order at {band_price} for band {k}")
+                                total_committed += order_size_contracts
+                            except Exception as e:
+                                logger.error(f"Failed to place new entry order for band {k}: {e}")
 
-            # When placing entry orders (long or short):
-            # Only place new entry orders if abs(position_size) < MAX_POSITION_SIZE
-            if signal == 'long' and position_size <= 0:
-                if position_size < 0:
-                    logger.info("Reversing from SHORT to LONG.")
-                    close_position(exchange, symbol, position_size, tick_size)
-                    if not wait_for_flat_position(exchange, symbol):
-                        logger.warning("Position did not flatten after reversal. Skipping entry.")
-                        continue
-                # Strict cap: check both filled and open entry orders
-                current_position = abs(position_size)
-                open_entry_orders = get_open_entry_orders(exchange, symbol, signal)
-                total_committed = current_position + open_entry_orders
-                remaining = MAX_POSITION_SIZE - total_committed
-                if remaining <= 0:
-                    logger.info("Max position size (including open orders) reached. No new entry orders will be placed.")
-                    continue
-                band_keys = ['-3', '-2.5', '-2', '-1.5', '-1']
-                suborder_size = 500
-                num_orders = min(remaining // suborder_size, len(band_keys))
-                place_laddered_entries(exchange, symbol, band_keys, 'buy', bands, suborder_size, num_orders, state, tick_size)
-            elif signal == 'short' and position_size >= 0:
-                if position_size > 0:
-                    logger.info("Reversing from LONG to SHORT.")
-                    close_position(exchange, symbol, position_size, tick_size)
-                    if not wait_for_flat_position(exchange, symbol):
-                        logger.warning("Position did not flatten after reversal. Skipping entry.")
-                        continue
-                current_position = abs(position_size)
-                open_entry_orders = get_open_entry_orders(exchange, symbol, signal)
-                total_committed = current_position + open_entry_orders
-                remaining = MAX_POSITION_SIZE - total_committed
-                if remaining <= 0:
-                    logger.info("Max position size (including open orders) reached. No new entry orders will be placed.")
-                    continue
-                band_keys = ['+1', '+1.5', '+2', '+2.5', '+3']
-                suborder_size = 500
-                num_orders = min(remaining // suborder_size, len(band_keys))
-                place_laddered_entries(exchange, symbol, band_keys, 'sell', bands, suborder_size, num_orders, state, tick_size)
-            elif signal == 'flat' and position_size != 0:
+            # 6. Main strategy logic (simplified)
+            if signal == 'flat' and position_size != 0:
                 logger.info("Signal is FLAT, closing position.")
                 close_position(exchange, symbol, position_size, tick_size)
-                action_taken = True
-            else:
-                logger.info("No action needed. Signal and position are aligned.")
 
             # --- Bollinger Band Stop Loss Logic ---
             # Only run if there is an open position
@@ -567,86 +603,8 @@ def main():
                     logger.warning("SOFT STOP LOSS triggered for SHORT: price above +4σ. Closing with limit orders.")
                     close_position(exchange, symbol, position_size, tick_size)
 
-            # Dynamic TP updating for open positions
-            if abs(position_size) >= 100:
-                if position_size > 0:
-                    tp_band_keys = ['+1', '+1.5', '+2', '+2.5', '+3']
-                    tp_side = 'sell'
-                else:
-                    tp_band_keys = ['-1', '-1.5', '-2', '-2.5', '-3']
-                    tp_side = 'buy'
-                tp_size = abs(position_size) // 5
-                # Cancel all existing TP orders
-                all_tp_ids = []
-                for tp_list in state.get('tp_order_ids', {}).values():
-                    all_tp_ids.extend(tp_list)
-                cancel_tp_orders(exchange, symbol, all_tp_ids)
-                # Place 5 new TP orders
-                new_tp_ids = []
-                for k in tp_band_keys:
-                    price = bands[k]
-                    logger.info(f"Placing TP order at {price:.2f} for {tp_size} contracts (band {k}σ)")
-                    order_id = None
-                    for attempt in range(3):
-                        try:
-                            order_id = place_limit_order(exchange, symbol, tp_side, tp_size, price, tick_size)
-                            if order_id:
-                                break
-                        except Exception as e:
-                            logger.error(f"Failed to place TP order at {price:.2f} (attempt {attempt+1}): {e}")
-                    if order_id:
-                        new_tp_ids.append(order_id)
-                    else:
-                        logger.error(f"Giving up on TP order at {price:.2f} after 3 attempts.")
-                # Store new TP order ids in state
-                state['tp_order_ids'] = {'main': new_tp_ids}
-                save_state(state)
-
-            # In main loop, after fetching position_size:
-            prev_position_size = state.get('last_known_position_size', 0)
-            if position_size != prev_position_size:
-                # Cancel all existing TP orders
-                all_tp_ids = []
-                for ids in state.get('tp_order_ids', {}).values():
-                    all_tp_ids.extend(ids)
-                for tp_id in all_tp_ids:
-                    try:
-                        exchange.cancel_order(tp_id, symbol)
-                        logger.info(f"Cancelled TP order {tp_id}")
-                    except Exception as e:
-                        logger.warning(f"Failed to cancel TP order {tp_id}: {e}")
-                state['tp_order_ids'] = {}
-                # Only place new TP orders if position is nonzero
-                if position_size != 0:
-                    total_contracts = abs(position_size)
-                    tp_count = 5
-                    tp_size = total_contracts // tp_count
-                    leftover = total_contracts % tp_count
-                    if position_size > 0:
-                        tp_band_keys = ['+1', '+1.5', '+2', '+2.5', '+3']
-                        tp_side = 'sell'
-                    else:
-                        tp_band_keys = ['-1', '-1.5', '-2', '-2.5', '-3']
-                        tp_side = 'buy'
-                    new_tp_ids = []
-                    for i, k in enumerate(tp_band_keys):
-                        price = bands[k]
-                        size = tp_size + (leftover if i == 0 else 0)
-                        try:
-                            tp_id = place_limit_order(exchange, symbol, tp_side, size, price, tick_size)
-                            if tp_id:
-                                new_tp_ids.append(tp_id)
-                                logger.info(f"Placed TP order at {price:.2f} for {size} contracts (band {k}σ)")
-                        except Exception as e:
-                            logger.warning(f"Failed to place TP order at {price:.2f}: {e}")
-                    state['tp_order_ids']['global'] = new_tp_ids
-                state['last_known_position_size'] = position_size
-                save_state(state)
-
-            if action_taken:
-                time.sleep(5)
-            else:
-                time.sleep(60)
+            # Sleep for 2 seconds before next cycle
+            time.sleep(2)
 
             # --- In main loop, after closing a position (flat signal or SL), cancel all TP orders ---
             if (signal == 'flat' and position_size != 0) or (position_size == 0):
